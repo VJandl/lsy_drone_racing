@@ -106,49 +106,103 @@ class MiControladorReto(Controller):
         trajectory = self._des_pos_spline(np.linspace(0, self._t_total, 100))
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
 
+    def quat_to_forward(self, q):
+        x, y, z, w = q
+
+        fx = 1 - 2*(y*y + z*z)
+        fy = 2*(x*y + w*z)
+        fz = 2*(x*z - w*y)
+
+        fwd = np.array([fx, fy, fz])
+        return fwd / (np.linalg.norm(fwd) + 1e-6)
+
+
     def update(self, obs, info, is_init=False):
-        
-        new_gates= obs.get("gates_pos", [])
+
+        new_gates = obs.get("gates_pos", [])
+        new_quats = obs.get("gates_quat", [])
         visited = np.array(obs.get("gates_visited", []), dtype=bool)
+
         if len(new_gates) == 0:
             return
 
-        new_gates= np.array(new_gates)
+        new_gates = np.array(new_gates)
+        new_quats = np.array(new_quats)
 
-        unvisited_gates = new_gates[~visited]
+        unvisited_idx = ~visited
+        unvisited_gates = new_gates[unvisited_idx]
+        unvisited_quats = new_quats[unvisited_idx]
 
         if len(unvisited_gates) == 0:
             return
-      
-        
-        if (is_init or 
-            len(unvisited_gates) != len(self.gates) or 
+
+        # only recompute if needed
+        if (is_init or
+            len(unvisited_gates) != len(self.gates) or
             not np.allclose(unvisited_gates, self.gates, atol=0.01)):
-            
+
             self.gates = unvisited_gates
-           
+            self.gates_squat = unvisited_quats
 
-            waypoints=np.vstack([obs["pos"], self.gates])
-            waypoints_xyz = waypoints[:, :3]
+            waypoints = []
+            start_pos = obs["pos"]
 
+            prev_pos = start_pos
+
+            for i in range(len(unvisited_gates)):
+
+                gate_pos = unvisited_gates[i]
+                gate_quat = unvisited_quats[i]
+
+                # --- direction from quaternion
+                dir_vec = self.quat_to_forward(gate_quat)
+
+                # --- shortest direction fix
+                to_gate = gate_pos - prev_pos
+                to_gate = to_gate / (np.linalg.norm(to_gate) + 1e-6)
+
+                if np.dot(dir_vec, to_gate) < 0:
+                    dir_vec = -dir_vec
+
+                # --- adaptive offset
+                if i < len(unvisited_gates) - 1:
+                    next_gate = unvisited_gates[i + 1]
+                    dist_next = np.linalg.norm(next_gate - gate_pos)
+                else:
+                    dist_next = np.linalg.norm(gate_pos - prev_pos)
+
+                d = np.clip(0.25 * dist_next, 0.3, 1.0)
+
+                # --- APPROACH POINT (key change)
+                approach = gate_pos - dir_vec * d
+
+                waypoints.append(approach)
+
+                prev_pos = gate_pos
+
+            # add final position (optional stabilizer)
+            waypoints.append(unvisited_gates[-1])
+
+            waypoints_xyz = np.vstack([obs["pos"], np.array(waypoints)])
+
+            # --- spline timing (unchanged)
             diffs = np.diff(waypoints_xyz, axis=0)
             distances = np.linalg.norm(diffs, axis=1)
 
             Velocity = 1
             distances = np.maximum(distances, 0.01)
             times_segment = distances / Velocity
+
             t = np.zeros(len(waypoints_xyz))
             t[1:] = np.cumsum(times_segment)
 
-            self._t_total = t[-1] # El tiempo total es la suma de todos los tramos
-            
+            self._t_total = t[-1]
+
             current_vel = obs.get("vel", np.zeros(3))
+
             self._des_pos_spline = CubicSpline(
-                t, waypoints_xyz, 
+                t, waypoints_xyz,
                 bc_type=((1, current_vel), 'not-a-knot')
             )
 
             self._tick = 0
-         
-           
-      
